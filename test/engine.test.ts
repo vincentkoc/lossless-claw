@@ -3601,6 +3601,98 @@ describe("LcmContextEngine.bootstrap", () => {
     expect(reconcileSpy).not.toHaveBeenCalled();
   });
 
+  it("ignores OpenClaw runtime-context sidecars during bootstrap imports", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-runtime-context-sidecar");
+    appendFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        type: "custom",
+        customType: "openclaw.runtime-context",
+        details: { source: "openclaw-runtime-context" },
+        text: "Conversation info (untrusted metadata): workspace=/tmp/project",
+      })}\n`,
+      "utf8",
+    );
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "real user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "real assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "bootstrap-runtime-context-sidecar";
+
+    const result = await engine.bootstrap({ sessionId, sessionFile });
+    expect(result).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual(["real user", "real assistant"]);
+  });
+
+  it("ignores OpenClaw runtime-context sidecars in append-only transcript tails", async () => {
+    const sessionFile = createSessionFilePath("append-only-runtime-context-sidecar");
+    const sm = SessionManager.open(sessionFile);
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "seed user" }],
+    } as AgentMessage);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed assistant" }],
+    } as AgentMessage);
+
+    const engine = createEngine();
+    const sessionId = "append-only-runtime-context-sidecar";
+
+    const first = await engine.bootstrap({ sessionId, sessionFile });
+    expect(first.bootstrapped).toBe(true);
+
+    const reconcileSpy = vi.spyOn(engine as any, "reconcileSessionTail");
+
+    appendFileSync(
+      sessionFile,
+      `${JSON.stringify({
+        type: "message",
+        details: { source: "openclaw-runtime-context" },
+        message: {
+          role: "assistant",
+          content: "Conversation info (untrusted metadata): do not ingest",
+        },
+      })}\n`,
+      "utf8",
+    );
+    sm.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: "tail user" }],
+    } as AgentMessage);
+
+    const second = await engine.bootstrap({ sessionId, sessionFile });
+    expect(second).toEqual({
+      bootstrapped: true,
+      importedMessages: 1,
+      reason: "reconciled missing session messages",
+    });
+    expect(reconcileSpy).not.toHaveBeenCalled();
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "seed user",
+      "seed assistant",
+      "tail user",
+    ]);
+  });
+
   it("refreshes the bootstrap checkpoint after afterTurn heartbeat pruning", async () => {
     const sessionFile = createSessionFilePath("append-only-after-turn-heartbeat-prune");
     const sm = SessionManager.open(sessionFile);
@@ -5916,6 +6008,32 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(assembledText).toContain("keep this turn");
     expect(assembledText).not.toContain("heartbeat poll");
     expect(assembledText).not.toContain("worker snapshot");
+  });
+
+  it("skips OpenClaw runtime-context messages during live ingestion", async () => {
+    const engine = createEngine();
+    const sessionId = "runtime-context-live-ingestion";
+    const runtimeContextMessage = {
+      role: "assistant",
+      customType: "openclaw.runtime-context",
+      details: { source: "openclaw-runtime-context" },
+      content: "Conversation info (untrusted metadata): workspace=/tmp/project",
+      timestamp: Date.now(),
+    } as unknown as AgentMessage;
+
+    const result = await engine.ingestBatch({
+      sessionId,
+      messages: [
+        runtimeContextMessage,
+        makeMessage({ role: "user", content: "keep this turn" }),
+      ],
+    });
+
+    expect(result.ingestedCount).toBe(1);
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual(["keep this turn"]);
   });
 
   it("afterTurn ingests auto-compaction summary and new turn messages", async () => {
@@ -9046,6 +9164,92 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
 
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((m) => m.content)).toEqual(["old A", "old B", "new C", "new D"]);
+  });
+
+  it("filters runtime-context messages before afterTurn replay dedup", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-runtime-context-filter";
+    const runtimeContextMessage = {
+      role: "assistant",
+      details: { source: "openclaw-runtime-context" },
+      content: "Conversation info (untrusted metadata): token budget payload",
+      timestamp: Date.now(),
+    } as unknown as AgentMessage;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-runtime-context-filter"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-runtime-context-filter-2"),
+      messages: [
+        makeMessage({ role: "system", content: "system prompt" }),
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+        runtimeContextMessage,
+        makeMessage({ role: "user", content: "new C" }),
+      ],
+      prePromptMessageCount: 1,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual(["old A", "old B", "new C"]);
+  });
+
+  it("uses message parts in afterTurn replay fingerprints for empty structured tool calls", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-empty-structured-tool-call";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-empty-structured-tool-call"),
+      messages: [
+        makeMessage({
+          role: "assistant",
+          content: [{ type: "function_call", call_id: "fc_old", name: "bash", arguments: "{}" }],
+        }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-empty-structured-tool-call-2"),
+      messages: [
+        makeMessage({
+          role: "assistant",
+          content: [{ type: "function_call", call_id: "fc_new", name: "bash", arguments: "{}" }],
+        }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(2);
+    expect(stored.map((m) => m.content)).toEqual(["", ""]);
+
+    const partCallIds = await Promise.all(
+      stored.map(async (message) => {
+        const parts = await engine.getConversationStore().getMessageParts(message.messageId);
+        return parts[0]?.toolCallId;
+      }),
+    );
+    expect(partCallIds).toEqual(["fc_old", "fc_new"]);
   });
 
   it("handles empty batch after slicing", async () => {

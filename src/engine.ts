@@ -63,6 +63,7 @@ import {
   ConversationStore,
   type ConversationRecord,
   type CreateMessagePartInput,
+  type MessageRecord,
   type MessagePartRecord,
   type MessagePartType,
 } from "./store/conversation-store.js";
@@ -191,6 +192,9 @@ const DYNAMIC_ACTIVITY_MEDIUM_UPSHIFT_FACTOR = 0.5;
 const DYNAMIC_ACTIVITY_MEDIUM_DOWNSHIFT_FACTOR = 0.35;
 const DYNAMIC_ACTIVITY_HIGH_UPSHIFT_FACTOR = 1.0;
 const DYNAMIC_ACTIVITY_HIGH_DOWNSHIFT_FACTOR = 0.75;
+const OPENCLAW_RUNTIME_CONTEXT_CUSTOM_TYPE = "openclaw.runtime-context";
+const OPENCLAW_RUNTIME_CONTEXT_SOURCE = "openclaw-runtime-context";
+const OPENCLAW_RUNTIME_CONTEXT_TEXT_MARKER = "Conversation info (untrusted metadata):";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -371,6 +375,57 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function safeBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
+}
+
+function collectRuntimeContextText(value: unknown, depth: number = 0): string | undefined {
+  if (value == null || depth > 5) {
+    return undefined;
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const chunks = value
+      .map((entry) => collectRuntimeContextText(entry, depth + 1))
+      .filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
+    return chunks.length > 0 ? chunks.join("\n") : undefined;
+  }
+  const record = asRecord(value);
+  if (!record) {
+    return undefined;
+  }
+  const chunks: string[] = [];
+  for (const key of ["text", "content", "message", "data", "payload", "value"]) {
+    const text = collectRuntimeContextText(record[key], depth + 1);
+    if (text) {
+      chunks.push(text);
+    }
+  }
+  return chunks.length > 0 ? chunks.join("\n") : undefined;
+}
+
+function isOpenClawRuntimeContextEnvelope(value: unknown): boolean {
+  const record = asRecord(value);
+  if (!record) {
+    return false;
+  }
+
+  const customType = safeString(record.customType) ?? safeString(record.custom_type);
+  if (customType === OPENCLAW_RUNTIME_CONTEXT_CUSTOM_TYPE) {
+    return true;
+  }
+
+  const details = asRecord(record.details);
+  const metadata = asRecord(record.metadata);
+  if (
+    safeString(details?.source) === OPENCLAW_RUNTIME_CONTEXT_SOURCE ||
+    safeString(metadata?.source) === OPENCLAW_RUNTIME_CONTEXT_SOURCE ||
+    safeString(record.source) === OPENCLAW_RUNTIME_CONTEXT_SOURCE
+  ) {
+    return true;
+  }
+
+  return collectRuntimeContextText(record)?.includes(OPENCLAW_RUNTIME_CONTEXT_TEXT_MARKER) === true;
 }
 
 function extractTranscriptToolCallId(message: AgentMessage): string | undefined {
@@ -1283,8 +1338,11 @@ function isBootstrapMessage(value: unknown): value is AgentMessage {
 }
 
 function extractCanonicalBootstrapMessage(value: unknown): AgentMessage | null {
+  if (isOpenClawRuntimeContextEnvelope(value)) {
+    return null;
+  }
   if (isBootstrapMessage(value)) {
-    return value;
+    return isOpenClawRuntimeContextEnvelope(value) ? null : value;
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -1292,6 +1350,9 @@ function extractCanonicalBootstrapMessage(value: unknown): AgentMessage | null {
   const entry = value as { type?: unknown; message?: unknown };
   if ("message" in entry) {
     if (entry.type !== undefined && entry.type !== "message") {
+      return null;
+    }
+    if (isOpenClawRuntimeContextEnvelope(entry.message)) {
       return null;
     }
     return isBootstrapMessage(entry.message) ? entry.message : null;
@@ -1630,6 +1691,53 @@ function readBootstrapMessageFromJsonLine(line: string | null): AgentMessage | n
 
 function messageIdentity(role: string, content: string): string {
   return `${role}\u0000${content}`;
+}
+
+type MessageSourceFingerprintPart = Pick<
+  CreateMessagePartInput | MessagePartRecord,
+  "partType" | "ordinal" | "textContent" | "toolCallId" | "toolName" | "toolInput" | "toolOutput" | "metadata"
+>;
+
+function stableMessagePartFingerprint(part: MessageSourceFingerprintPart): Record<string, unknown> {
+  return {
+    partType: part.partType,
+    ordinal: part.ordinal,
+    textContent: part.textContent ?? null,
+    toolCallId: part.toolCallId ?? null,
+    toolName: part.toolName ?? null,
+    toolInput: part.toolInput ?? null,
+    toolOutput: part.toolOutput ?? null,
+    metadata: part.metadata ?? null,
+  };
+}
+
+function messageSourceFingerprint(params: {
+  role: string;
+  content: string;
+  parts?: MessageSourceFingerprintPart[];
+}): string {
+  const parts = params.parts ?? [];
+  if (parts.length === 0) {
+    return messageIdentity(params.role, params.content);
+  }
+  return JSON.stringify({
+    role: params.role,
+    content: params.content,
+    parts: parts.map(stableMessagePartFingerprint),
+  });
+}
+
+function agentMessageSourceFingerprint(message: AgentMessage): string {
+  const stored = toStoredMessage(message);
+  return messageSourceFingerprint({
+    role: stored.role,
+    content: stored.content,
+    parts: buildMessageParts({
+      sessionId: "source-fingerprint",
+      message,
+      fallbackContent: stored.content,
+    }),
+  });
 }
 
 // ── LcmContextEngine ────────────────────────────────────────────────────────
@@ -4926,6 +5034,23 @@ export class LcmContextEngine implements ContextEngine {
    *    is prepended — synthetic summaries can no longer interfere with
    *    replay detection
    */
+  private async storedMessageSourceFingerprint(message: MessageRecord): Promise<string> {
+    const parts = await this.conversationStore.getMessageParts(message.messageId);
+    return messageSourceFingerprint({
+      role: message.role,
+      content: message.content,
+      parts,
+    });
+  }
+
+  private async storedMessageSourceFingerprints(messages: MessageRecord[]): Promise<string[]> {
+    const fingerprints: string[] = [];
+    for (const message of messages) {
+      fingerprints.push(await this.storedMessageSourceFingerprint(message));
+    }
+    return fingerprints;
+  }
+
   private async deduplicateAfterTurnBatch(
     sessionId: string,
     sessionKey: string | undefined,
@@ -4947,6 +5072,8 @@ export class LcmContextEngine implements ContextEngine {
     if (!lastDbMessage) return batch;
 
     const storedBatch = batch.map((m) => toStoredMessage(m));
+    const batchFingerprints = batch.map(agentMessageSourceFingerprint);
+    const lastDbFingerprint = await this.storedMessageSourceFingerprint(lastDbMessage);
 
     // When the DB already has more messages than the incoming batch,
     // the batch may be a tail-only replay. Try tail-matching first,
@@ -4956,24 +5083,24 @@ export class LcmContextEngine implements ContextEngine {
         conversationId,
         batch,
         storedBatch,
+        batchFingerprints,
         storedMessageCount,
         lastDbMessage,
+        lastDbFingerprint,
       );
     }
 
     // Aligned-tail check: DB's last message must match the message at the
     // exact replay boundary in the incoming batch. This replaces the
     // hasMessage() check which could false-positive on any repeated content.
-    const batchAtBoundary = storedBatch[storedMessageCount - 1]!;
-    if (
-      messageIdentity(lastDbMessage.role, lastDbMessage.content) !==
-      messageIdentity(batchAtBoundary.role, batchAtBoundary.content)
-    ) {
+    const batchBoundaryFingerprint = batchFingerprints[storedMessageCount - 1]!;
+    if (lastDbFingerprint !== batchBoundaryFingerprint) {
       // Prefix mismatch — attempt suffix fallback before giving up.
       return this.deduplicateSuffixFallback(
         conversationId,
         batch,
         storedBatch,
+        batchFingerprints,
         storedMessageCount,
         "prefix-mismatch",
       );
@@ -4987,13 +5114,9 @@ export class LcmContextEngine implements ContextEngine {
     if (storedMessages.length !== storedMessageCount) {
       return batch;
     }
+    const storedFingerprints = await this.storedMessageSourceFingerprints(storedMessages);
     for (let i = 0; i < storedMessageCount; i += 1) {
-      const storedConversationMessage = storedMessages[i]!;
-      const incomingMessage = storedBatch[i]!;
-      if (
-        messageIdentity(storedConversationMessage.role, storedConversationMessage.content) !==
-        messageIdentity(incomingMessage.role, incomingMessage.content)
-      ) {
+      if (storedFingerprints[i] !== batchFingerprints[i]) {
         return batch;
       }
     }
@@ -5010,30 +5133,33 @@ export class LcmContextEngine implements ContextEngine {
     conversationId: number,
     batch: AgentMessage[],
     storedBatch: ReturnType<typeof toStoredMessage>[],
+    batchFingerprints: string[],
     storedMessageCount: number,
     lastDbMessage: { role: string; content: string },
+    lastDbFingerprint: string,
   ): Promise<AgentMessage[]> {
     const lastBatchIdentity = messageIdentity(
       storedBatch[storedBatch.length - 1]!.role,
       storedBatch[storedBatch.length - 1]!.content,
     );
-    const lastDbIdentity = messageIdentity(lastDbMessage.role, lastDbMessage.content);
+    const lastBatchFingerprint = batchFingerprints[batchFingerprints.length - 1]!;
 
     // Quick check: if the last DB message matches the last batch message,
     // verify that the entire batch matches the actual DB tail. Message seq
     // can have gaps after maintenance deletes, so do not derive seq from count.
-    if (lastDbIdentity === lastBatchIdentity) {
+    if (
+      lastDbFingerprint === lastBatchFingerprint ||
+      messageIdentity(lastDbMessage.role, lastDbMessage.content) === lastBatchIdentity
+    ) {
       const storedMessages = await this.conversationStore.getMessages(conversationId, {
         limit: storedMessageCount,
       });
       const tailMessages = storedMessages.slice(-batch.length);
       if (tailMessages.length === batch.length) {
+        const tailFingerprints = await this.storedMessageSourceFingerprints(tailMessages);
         let tailMatch = true;
         for (let i = 0; i < batch.length; i++) {
-          if (
-            messageIdentity(tailMessages[i]!.role, tailMessages[i]!.content) !==
-            messageIdentity(storedBatch[i]!.role, storedBatch[i]!.content)
-          ) {
+          if (tailFingerprints[i] !== batchFingerprints[i]) {
             tailMatch = false;
             break;
           }
@@ -5053,6 +5179,7 @@ export class LcmContextEngine implements ContextEngine {
       conversationId,
       batch,
       storedBatch,
+      batchFingerprints,
       storedMessageCount,
       "oversized",
     );
@@ -5067,6 +5194,7 @@ export class LcmContextEngine implements ContextEngine {
     conversationId: number,
     batch: AgentMessage[],
     storedBatch: ReturnType<typeof toStoredMessage>[],
+    batchFingerprints: string[],
     storedMessageCount: number,
     context: string,
   ): Promise<AgentMessage[]> {
@@ -5075,6 +5203,8 @@ export class LcmContextEngine implements ContextEngine {
     });
     if (allStored.length === 0) return batch;
 
+    const allStoredFingerprints = await this.storedMessageSourceFingerprints(allStored);
+    const lastStoredFingerprint = allStoredFingerprints[allStoredFingerprints.length - 1]!;
     const lastStoredIdentity = messageIdentity(
       allStored[allStored.length - 1]!.role,
       allStored[allStored.length - 1]!.content,
@@ -5082,6 +5212,7 @@ export class LcmContextEngine implements ContextEngine {
 
     for (let k = batch.length - 1; k >= 0; k--) {
       if (
+        batchFingerprints[k] !== lastStoredFingerprint &&
         messageIdentity(storedBatch[k]!.role, storedBatch[k]!.content) !== lastStoredIdentity
       ) {
         continue;
@@ -5090,16 +5221,7 @@ export class LcmContextEngine implements ContextEngine {
       const startDb = allStored.length - matchLen;
       let suffixMatch = true;
       for (let j = 0; j < matchLen; j++) {
-        if (
-          messageIdentity(
-            allStored[startDb + j]!.role,
-            allStored[startDb + j]!.content,
-          ) !==
-          messageIdentity(
-            storedBatch[k - matchLen + 1 + j]!.role,
-            storedBatch[k - matchLen + 1 + j]!.content,
-          )
-        ) {
+        if (allStoredFingerprints[startDb + j] !== batchFingerprints[k - matchLen + 1 + j]) {
           suffixMatch = false;
           break;
         }
@@ -5366,6 +5488,9 @@ export class LcmContextEngine implements ContextEngine {
   }): Promise<IngestResult> {
     const { sessionId, sessionKey, message, isHeartbeat } = params;
     if (isHeartbeat) {
+      return { ingested: false };
+    }
+    if (isOpenClawRuntimeContextEnvelope(message)) {
       return { ingested: false };
     }
 
@@ -5691,7 +5816,9 @@ export class LcmContextEngine implements ContextEngine {
     // Dedup guard: prevent duplicate ingestion when gateway restart replays
     // full history. Run on newMessages BEFORE prepending autoCompactionSummary
     // so synthetic summaries cannot interfere with replay detection.
-    const newMessages = params.messages.slice(params.prePromptMessageCount);
+    const newMessages = params.messages
+      .slice(params.prePromptMessageCount)
+      .filter((message) => !isOpenClawRuntimeContextEnvelope(message));
     const dedupedNewMessages = await this.deduplicateAfterTurnBatch(
       params.sessionId,
       params.sessionKey,
